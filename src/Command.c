@@ -1,12 +1,51 @@
 #include <efi.h>
 #include <efilib.h>
 
+#define IZH_OPERATORS 1
+
+static BOOLEAN gFailed;
+
+static BOOLEAN FmtHas(CONST CHAR16 *F, CONST CHAR16 *P)
+{
+    UINTN I;
+    UINTN J;
+
+    for (I = 0; F[I]; I++) {
+        for (J = 0; P[J] && F[I + J] == P[J]; J++) {
+        }
+        if (P[J] == 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static VOID NoteFmt(CONST CHAR16 *F)
+{
+    static CONST CHAR16 *Bad[] = {
+        L"%r", L"Usage", L"too long", L"not a dir", L"is a dir", L"not recognized",
+        L"cannot", L"must be", L"are the same", L"No matches", L"not empty",
+        L"already exists", L"Invalid", L"unavailable", L"Out of memory", L"too small",
+        L"Syntax error", NULL
+    };
+    UINTN I;
+
+    for (I = 0; Bad[I] != NULL; I++) {
+        if (FmtHas(F, Bad[I])) {
+            gFailed = TRUE;
+            return;
+        }
+    }
+}
+
+#define Print(Fmt, ...) (NoteFmt(Fmt), Print(Fmt, ##__VA_ARGS__))
+
 #define MAXP 512
 #define MAXLINE 512
 #define MAXARGS 32
 #define HISTORY 16
 #define SYSTEM_DIR L"\\IzhOS\\System"
-#define SHELL_VERSION L"1.0"
+#define SHELL_VERSION L"1.5"
 #define NPOS ((UINTN)-1)
 
 typedef struct {
@@ -2590,6 +2629,8 @@ static VOID CmdHelp(VOID)
     Print(L"  ver                       show version\n");
     Print(L"  reboot                    restart the machine\n");
     Print(L"  exit                      shut down\n");
+    Print(L"  a | b    a > file    a >> file    a < file    a ; b    a && b    a || b    a & b\n");
+    Print(L"  pipe filters: cat, sort [/r], find /t <text>, wc, head [n], tail [n]\n");
     Print(L"\nAny .efi program can be run by typing its name.\n\n");
 }
 
@@ -2623,7 +2664,7 @@ static VOID Tokenize(CHAR16 *Line, CHAR16 **Argv, INTN *Argc)
     }
 }
 
-static VOID Process(CHAR16 *Line)
+static VOID ProcessSimple(CHAR16 *Line)
 {
     CHAR16 Work[MAXLINE + 4];
     CHAR16 Raw[MAXLINE + 4];
@@ -2736,6 +2777,609 @@ static VOID Process(CHAR16 *Line)
         uefi_call_wrapper(RT->ResetSystem, 4, EfiResetCold, EFI_SUCCESS, (UINTN)0, NULL);
     } else {
         RunExternal(Argv[0], Raw);
+    }
+}
+
+typedef struct {
+    UINT8 *Data;
+    UINTN Len;
+    UINTN Cap;
+} OpBuf;
+
+typedef struct {
+    CHAR16 *Text;
+    INTN Op;
+} OpSeg;
+
+#define OP_NONE 0
+#define OP_SEMI 1
+#define OP_AMP 2
+#define OP_AND 3
+#define OP_OR 4
+#define OP_PIPE 5
+#define OP_MAXSEG 64
+
+static OpBuf *gOpCap;
+static SIMPLE_TEXT_OUTPUT_INTERFACE gOpOut;
+static SIMPLE_TEXT_OUTPUT_INTERFACE *gOpReal;
+static UINT8 *gOpIn;
+static UINTN gOpInLen;
+static BOOLEAN gOpHasIn;
+
+static VOID OpAdd(OpBuf *B, UINT8 C)
+{
+    UINT8 *N;
+    UINTN Cap;
+
+    if (B->Len + 1 >= B->Cap) {
+        Cap = B->Cap ? B->Cap * 2 : 1024;
+        N = AllocatePool(Cap);
+        if (N == NULL) {
+            return;
+        }
+        if (B->Data != NULL) {
+            CopyMem(N, B->Data, B->Len);
+            FreePool(B->Data);
+        }
+        B->Data = N;
+        B->Cap = Cap;
+    }
+    B->Data[B->Len++] = C;
+}
+
+static EFI_STATUS __attribute__((ms_abi)) OpWrite(SIMPLE_TEXT_OUTPUT_INTERFACE *This, CHAR16 *Str)
+{
+    if (gOpCap != NULL) {
+        for (; *Str; Str++) {
+            if (*Str != L'\r') {
+                OpAdd(gOpCap, *Str < 128 ? (UINT8)*Str : (UINT8)'?');
+            }
+        }
+    }
+    return EFI_SUCCESS;
+}
+
+static VOID OpCapBegin(OpBuf *B)
+{
+    gOpCap = B;
+    gOpReal = ST->ConOut;
+    CopyMem(&gOpOut, gOpReal, sizeof(gOpOut));
+    gOpOut.OutputString = (typeof(gOpOut.OutputString))OpWrite;
+    ST->ConOut = &gOpOut;
+}
+
+static VOID OpCapEnd(VOID)
+{
+    ST->ConOut = gOpReal;
+    gOpCap = NULL;
+}
+
+static VOID OpSetIn(UINT8 *D, UINTN L)
+{
+    if (gOpIn != NULL) {
+        FreePool(gOpIn);
+    }
+    gOpIn = D;
+    gOpInLen = L;
+    gOpHasIn = TRUE;
+}
+
+static VOID OpClearIn(VOID)
+{
+    if (gOpIn != NULL) {
+        FreePool(gOpIn);
+    }
+    gOpIn = NULL;
+    gOpInLen = 0;
+    gOpHasIn = FALSE;
+}
+
+static VOID OpPut(UINT8 *D, UINTN Len)
+{
+    CHAR16 T[130];
+    UINTN N = 0;
+    UINTN I;
+
+    for (I = 0; I < Len; I++) {
+        if (D[I] == '\n') {
+            T[N++] = L'\r';
+            T[N++] = L'\n';
+        } else {
+            T[N++] = D[I];
+        }
+        if (N >= 126) {
+            T[N] = 0;
+            Out(T);
+            N = 0;
+        }
+    }
+    T[N] = 0;
+    Out(T);
+}
+
+static BOOLEAN OpLoad(CHAR16 *Arg)
+{
+    CHAR16 Abs[MAXP];
+    UINT8 *D;
+    UINTN L;
+    EFI_STATUS S;
+
+    if (!Resolve(Arg, Abs)) {
+        Print(L"Path too long\n");
+        return FALSE;
+    }
+    S = ReadWhole(Abs, &D, &L);
+    if (EFI_ERROR(S)) {
+        Print(L"%s: %r\n", Arg, S);
+        return FALSE;
+    }
+    OpSetIn(D, L);
+    return TRUE;
+}
+
+static BOOLEAN OpTable(UINTN **St, UINTN **En, UINTN *Count)
+{
+    UINTN N = 0;
+    UINTN I;
+    UINTN K = 0;
+    UINTN Start = 0;
+    UINTN E;
+
+    for (I = 0; I < gOpInLen; I++) {
+        if (gOpIn[I] == '\n') {
+            N++;
+        }
+    }
+    if (gOpInLen > 0 && gOpIn[gOpInLen - 1] != '\n') {
+        N++;
+    }
+    *Count = N;
+    *St = AllocatePool((N + 1) * sizeof(UINTN));
+    *En = AllocatePool((N + 1) * sizeof(UINTN));
+    if (*St == NULL || *En == NULL) {
+        if (*St != NULL) {
+            FreePool(*St);
+        }
+        if (*En != NULL) {
+            FreePool(*En);
+        }
+        return FALSE;
+    }
+    for (I = 0; I <= gOpInLen && K < N; I++) {
+        if (I == gOpInLen || gOpIn[I] == '\n') {
+            E = I;
+            if (E > Start && gOpIn[E - 1] == '\r') {
+                E--;
+            }
+            (*St)[K] = Start;
+            (*En)[K] = E;
+            K++;
+            Start = I + 1;
+        }
+    }
+    return TRUE;
+}
+
+static VOID OpLine(UINTN S, UINTN E)
+{
+    OpPut(gOpIn + S, E - S);
+    OpPut((UINT8 *)"\n", 1);
+}
+
+static INTN OpCmp(UINTN A, UINTN B, UINTN *St, UINTN *En)
+{
+    UINTN I = St[A];
+    UINTN J = St[B];
+    UINT8 X;
+    UINT8 Y;
+
+    while (I < En[A] && J < En[B]) {
+        X = gOpIn[I];
+        Y = gOpIn[J];
+        if (X >= 'a' && X <= 'z') {
+            X -= 32;
+        }
+        if (Y >= 'a' && Y <= 'z') {
+            Y -= 32;
+        }
+        if (X != Y) {
+            return X < Y ? -1 : 1;
+        }
+        I++;
+        J++;
+    }
+    if (I < En[A]) {
+        return 1;
+    }
+    if (J < En[B]) {
+        return -1;
+    }
+    return 0;
+}
+
+static BOOLEAN OpIsNum(CHAR16 *S)
+{
+    if (*S == 0) {
+        return FALSE;
+    }
+    for (; *S; S++) {
+        if (*S < L'0' || *S > L'9') {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOLEAN OpFilter(CHAR16 *T)
+{
+    CHAR16 Work[MAXLINE + 4];
+    CHAR16 Tmp[MAXLINE];
+    CHAR16 *Argv[MAXARGS];
+    CHAR16 *File = NULL;
+    CHAR16 *Cmd;
+    UINTN *St = NULL;
+    UINTN *En = NULL;
+    UINTN *Idx = NULL;
+    UINTN N = 0;
+    UINTN I;
+    UINTN J;
+    UINTN K;
+    UINTN Want = 10;
+    UINTN Words = 0;
+    BOOLEAN Rev = FALSE;
+    BOOLEAN In = FALSE;
+    BOOLEAN Cat;
+    BOOLEAN Find;
+    BOOLEAN Sort;
+    BOOLEAN Wc;
+    BOOLEAN Head;
+    BOOLEAN Tail;
+    INTN Argc;
+    INTN A;
+
+    StrnCpy(Work, T, MAXLINE + 3);
+    Work[MAXLINE + 3] = 0;
+    Tokenize(Work, Argv, &Argc);
+    if (Argc == 0) {
+        return FALSE;
+    }
+    Cmd = Argv[0];
+    Cat = !StriCmp(Cmd, L"cat") || (!StriCmp(Cmd, L"type") && Argc == 1 && gOpHasIn);
+    Find = !StriCmp(Cmd, L"find") && Argc == 3 && !StriCmp(Argv[1], L"/t") && gOpHasIn;
+    Sort = !StriCmp(Cmd, L"sort");
+    Wc = gOpHasIn && !StriCmp(Cmd, L"wc");
+    Head = gOpHasIn && !StriCmp(Cmd, L"head");
+    Tail = gOpHasIn && !StriCmp(Cmd, L"tail");
+    if (!Cat && !Find && !Sort && !Wc && !Head && !Tail) {
+        return FALSE;
+    }
+    if (!Find) {
+        for (A = 1; A < Argc; A++) {
+            if (!StriCmp(Argv[A], L"/r")) {
+                Rev = TRUE;
+            } else if (OpIsNum(Argv[A])) {
+                Want = (UINTN)Atoi(Argv[A]);
+            } else {
+                File = Argv[A];
+            }
+        }
+    }
+    if (File != NULL && !OpLoad(File)) {
+        return TRUE;
+    }
+    if (!gOpHasIn) {
+        Print(L"Usage: %s <file>  or  <command> | %s\n", Cmd, Cmd);
+        return TRUE;
+    }
+    if (Cat) {
+        OpPut(gOpIn, gOpInLen);
+        return TRUE;
+    }
+    if (!OpTable(&St, &En, &N)) {
+        Print(L"Out of memory\n");
+        return TRUE;
+    }
+
+    if (Find) {
+        for (I = 0; I < N; I++) {
+            for (J = 0; J < En[I] - St[I] && J < MAXLINE - 1; J++) {
+                Tmp[J] = (CHAR16)gOpIn[St[I] + J];
+            }
+            Tmp[J] = 0;
+            if (ContainsNoCase(Tmp, Argv[2])) {
+                OpLine(St[I], En[I]);
+            }
+        }
+    } else if (Sort) {
+        Idx = AllocatePool((N + 1) * sizeof(UINTN));
+        if (Idx != NULL) {
+            for (I = 0; I < N; I++) {
+                K = I;
+                while (K > 0 && (Rev ? OpCmp(Idx[K - 1], I, St, En) < 0 : OpCmp(Idx[K - 1], I, St, En) > 0)) {
+                    Idx[K] = Idx[K - 1];
+                    K--;
+                }
+                Idx[K] = I;
+            }
+            for (I = 0; I < N; I++) {
+                OpLine(St[Idx[I]], En[Idx[I]]);
+            }
+            FreePool(Idx);
+        }
+    } else if (Wc) {
+        for (I = 0; I < gOpInLen; I++) {
+            if (gOpIn[I] == ' ' || gOpIn[I] == '\n' || gOpIn[I] == '\t' || gOpIn[I] == '\r') {
+                In = FALSE;
+            } else if (!In) {
+                In = TRUE;
+                Words++;
+            }
+        }
+        Print(L"%lu lines  %lu words  %lu bytes\n", (UINT64)N, (UINT64)Words, (UINT64)gOpInLen);
+    } else {
+        I = Head ? 0 : (N > Want ? N - Want : 0);
+        K = Head ? (Want < N ? Want : N) : N;
+        for (; I < K; I++) {
+            OpLine(St[I], En[I]);
+        }
+    }
+    FreePool(St);
+    FreePool(En);
+    return TRUE;
+}
+
+static BOOLEAN OpWriteFile(CHAR16 *Name, OpBuf *B, BOOLEAN Append)
+{
+    CHAR16 Abs[MAXP];
+    EFI_FILE_HANDLE F;
+    EFI_STATUS S;
+    UINTN N;
+
+    if (!Resolve(Name, Abs)) {
+        Print(L"Path too long\n");
+        return FALSE;
+    }
+    if (!Append && !EFI_ERROR(OpenAbs(Abs, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0, &F))) {
+        uefi_call_wrapper(F->Delete, 1, F);
+    }
+    S = OpenAbs(Abs, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0, &F);
+    if (EFI_ERROR(S)) {
+        Print(L"%s: %r\n", Name, S);
+        return FALSE;
+    }
+    if (Append) {
+        uefi_call_wrapper(F->SetPosition, 2, F, (UINT64)0xFFFFFFFFFFFFFFFFULL);
+    }
+    N = B->Len;
+    if (N > 0) {
+        S = uefi_call_wrapper(F->Write, 3, F, &N, B->Data);
+    }
+    CloseFile(F);
+    if (EFI_ERROR(S)) {
+        Print(L"%s: %r\n", Name, S);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOLEAN OpRedir(CHAR16 *T, CHAR16 *In, CHAR16 *OutName, BOOLEAN *Append)
+{
+    CHAR16 *P = T;
+    CHAR16 *Dst;
+    BOOLEAN InQ = FALSE;
+    BOOLEAN Q;
+    UINTN N;
+
+    In[0] = 0;
+    OutName[0] = 0;
+    *Append = FALSE;
+    while (*P) {
+        if (*P == L'"') {
+            InQ = !InQ;
+            P++;
+            continue;
+        }
+        if (InQ || (*P != L'<' && *P != L'>')) {
+            P++;
+            continue;
+        }
+        if (*P == L'<') {
+            Dst = In;
+        } else {
+            Dst = OutName;
+            *Append = (P[1] == L'>');
+            if (*Append) {
+                *P++ = L' ';
+            }
+        }
+        *P++ = L' ';
+        while (*P == L' ' || *P == L'\t') {
+            P++;
+        }
+        Q = (*P == L'"');
+        if (Q) {
+            *P++ = L' ';
+        }
+        N = 0;
+        while (*P && (Q ? *P != L'"' : (*P != L' ' && *P != L'\t' && *P != L'<' && *P != L'>'))) {
+            if (N + 1 < MAXP) {
+                Dst[N++] = *P;
+            }
+            *P++ = L' ';
+        }
+        Dst[N] = 0;
+        if (Q && *P == L'"') {
+            *P++ = L' ';
+        }
+        if (N == 0) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static INTN OpSplit(CHAR16 *Line, OpSeg *Segs)
+{
+    CHAR16 *P = Line;
+    CHAR16 *Start = Line;
+    BOOLEAN InQ = FALSE;
+    INTN N = 0;
+    INTN Op;
+    INTN Skip;
+
+    for (;; P++) {
+        if (*P == L'"') {
+            InQ = !InQ;
+            continue;
+        }
+        if (*P != 0 && InQ) {
+            continue;
+        }
+        if (*P != 0 && *P != L';' && *P != L'&' && *P != L'|') {
+            continue;
+        }
+        Op = OP_NONE;
+        Skip = 1;
+        if (*P == L';') {
+            Op = OP_SEMI;
+        } else if (*P == L'&') {
+            Op = (P[1] == L'&') ? OP_AND : OP_AMP;
+            Skip = (P[1] == L'&') ? 2 : 1;
+        } else if (*P == L'|') {
+            Op = (P[1] == L'|') ? OP_OR : OP_PIPE;
+            Skip = (P[1] == L'|') ? 2 : 1;
+        }
+        if (N >= OP_MAXSEG) {
+            break;
+        }
+        Segs[N].Text = Start;
+        Segs[N].Op = Op;
+        N++;
+        if (*P == 0) {
+            break;
+        }
+        *P = 0;
+        P += Skip - 1;
+        Start = P + 1;
+    }
+    return N;
+}
+
+static BOOLEAN OpBlank(CHAR16 *T)
+{
+    for (; *T; T++) {
+        if (*T != L' ' && *T != L'\t') {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOLEAN OpRun(OpSeg *S, INTN From, INTN To)
+{
+    CHAR16 InName[MAXP];
+    CHAR16 OutName[MAXP];
+    CHAR16 *T;
+    OpBuf Buf;
+    BOOLEAN Append;
+    BOOLEAN ToFile;
+    BOOLEAN Cap;
+    BOOLEAN Failed = FALSE;
+    UINTN L;
+    INTN I;
+
+    OpClearIn();
+    for (I = From; I <= To; I++) {
+        T = S[I].Text;
+        if (!OpRedir(T, InName, OutName, &Append)) {
+            Print(L"Syntax error: missing file name\n");
+            OpClearIn();
+            return TRUE;
+        }
+        L = StrLen(T);
+        while (L > 0 && (T[L - 1] == L' ' || T[L - 1] == L'\t')) {
+            T[--L] = 0;
+        }
+        while (*T == L' ' || *T == L'\t') {
+            T++;
+        }
+        if (*T == 0) {
+            Print(L"Syntax error: empty command\n");
+            OpClearIn();
+            return TRUE;
+        }
+        if (InName[0] != 0) {
+            if (I != From) {
+                Print(L"Syntax error: input redirection after a pipe\n");
+                OpClearIn();
+                return TRUE;
+            }
+            if (!OpLoad(InName)) {
+                OpClearIn();
+                return TRUE;
+            }
+        }
+        ToFile = OutName[0] != 0;
+        Cap = ToFile || I < To;
+        ZeroMem(&Buf, sizeof(Buf));
+        gFailed = FALSE;
+        if (Cap) {
+            OpCapBegin(&Buf);
+        }
+        if (!OpFilter(T)) {
+            ProcessSimple(T);
+        }
+        if (Cap) {
+            OpCapEnd();
+        }
+        Failed = gFailed;
+        OpClearIn();
+        if (ToFile) {
+            if (!OpWriteFile(OutName, &Buf, Append)) {
+                Failed = TRUE;
+            }
+            if (Buf.Data != NULL) {
+                FreePool(Buf.Data);
+            }
+            if (I < To) {
+                OpSetIn(NULL, 0);
+            }
+        } else if (Cap) {
+            OpSetIn(Buf.Data, Buf.Len);
+        }
+    }
+    OpClearIn();
+    return Failed;
+}
+
+static VOID Process(CHAR16 *Line)
+{
+    OpSeg Segs[OP_MAXSEG];
+    INTN N;
+    INTN I = 0;
+    INTN J;
+    INTN Prev = OP_SEMI;
+    BOOLEAN Failed = FALSE;
+    BOOLEAN Run;
+
+    N = OpSplit(Line, Segs);
+    while (I < N && !gExit) {
+        J = I;
+        while (J < N - 1 && Segs[J].Op == OP_PIPE) {
+            J++;
+        }
+        Run = TRUE;
+        if (Prev == OP_AND && Failed) {
+            Run = FALSE;
+        }
+        if (Prev == OP_OR && !Failed) {
+            Run = FALSE;
+        }
+        if (Run && !(I == J && OpBlank(Segs[I].Text))) {
+            Failed = OpRun(Segs, I, J);
+        }
+        Prev = Segs[J].Op;
+        I = J + 1;
     }
 }
 
