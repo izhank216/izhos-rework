@@ -26,7 +26,7 @@ static VOID NoteFmt(CONST CHAR16 *F)
         L"%r", L"Usage", L"too long", L"not a dir", L"is a dir", L"not recognized",
         L"cannot", L"must be", L"are the same", L"No matches", L"not empty",
         L"already exists", L"Invalid", L"unavailable", L"Out of memory", L"too small",
-        L"Syntax error", NULL
+        L"Syntax error", L"not available", NULL
     };
     UINTN I;
 
@@ -45,7 +45,7 @@ static VOID NoteFmt(CONST CHAR16 *F)
 #define MAXARGS 32
 #define HISTORY 16
 #define SYSTEM_DIR L"\\IzhOS\\System"
-#define SHELL_VERSION L"1.5"
+#define SHELL_VERSION L"1.75"
 #define NPOS ((UINTN)-1)
 
 typedef struct {
@@ -87,8 +87,11 @@ typedef struct {
 
 static EFI_HANDLE gImage;
 static EFI_HANDLE gDevice;
-static EFI_FILE_HANDLE gRoot;
+static EFI_FILE_HANDLE gDrvRoot[26];
+static CHAR16 gDrvCwd[26][MAXP];
+static UINTN gDrvCur = 2;
 static CHAR16 gCwd[MAXP];
+static EFI_GUID gDrvGuid = { 0x7a1c5e43, 0x3b9d, 0x4f08, { 0x9e, 0x61, 0x2d, 0xc4, 0xa8, 0x53, 0x17, 0xb0 } };
 static CHAR16 gHistory[HISTORY][MAXLINE];
 static UINTN gHistCount;
 static BOOLEAN gExit;
@@ -101,6 +104,16 @@ static CHAR16 UpCase(CHAR16 C)
     return C;
 }
 
+static INTN DriveOf(CHAR16 *P)
+{
+    CHAR16 C = UpCase(P[0]);
+
+    if (C >= L'A' && C <= L'Z' && P[1] == L':') {
+        return (INTN)(C - L'A');
+    }
+    return -1;
+}
+
 static VOID Out(CONST CHAR16 *S)
 {
     uefi_call_wrapper(ST->ConOut->OutputString, 2, ST->ConOut, (CHAR16 *)S);
@@ -110,6 +123,24 @@ static VOID ResetConsole(VOID)
 {
     uefi_call_wrapper(ST->ConOut->SetAttribute, 2, ST->ConOut, EFI_TEXT_ATTR(EFI_LIGHTGRAY, EFI_BLACK));
     uefi_call_wrapper(ST->ConOut->EnableCursor, 2, ST->ConOut, TRUE);
+}
+
+// alright why did i even add this
+static VOID *M_Alloc(UINTN Size)
+{
+    VOID *Ptr = NULL;
+    EFI_STATUS Status;
+
+    if (Size == 0) {
+        return NULL;
+    }
+
+    Status = uefi_call_wrapper(BS->AllocatePool, 3, EfiBootServicesData, Size, &Ptr);
+    if (EFI_ERROR(Status) || Ptr == NULL) {
+        return NULL;
+    }
+
+    return Ptr;
 }
 
 static EFI_INPUT_KEY GetKey(VOID)
@@ -199,8 +230,8 @@ static BOOLEAN InsideOrEqual(CHAR16 *Path, CHAR16 *Dir)
     UINTN Len = StrLen(Dir);
     UINTN I;
 
-    if (Len == 1 && Dir[0] == L'\\') {
-        return TRUE;
+    if (Len == 3 && Dir[1] == L':' && Dir[2] == L'\\') {
+        return UpCase(Path[0]) == UpCase(Dir[0]);
     }
     if (StrLen(Path) < Len) {
         return FALSE;
@@ -217,30 +248,49 @@ static BOOLEAN Resolve(CHAR16 *Input, CHAR16 *Result)
 {
     CHAR16 Joined[MAXP];
     CHAR16 Comp[MAXP];
+    CHAR16 Base[MAXP];
+    CHAR16 *Rest = Input;
+    UINTN Drive = gDrvCur;
     UINTN I = 0;
     UINTN N;
     UINTN Len;
+    INTN D = DriveOf(Input);
 
-    if (StrLen(Input) == 0) {
-        StrCpy(Result, gCwd);
+    if (D >= 0) {
+        Drive = (UINTN)D;
+        Rest = Input + 2;
+    }
+    if (Drive == gDrvCur) {
+        StrCpy(Base, gCwd + 2);
+    } else if (gDrvCwd[Drive][0] != 0) {
+        StrCpy(Base, gDrvCwd[Drive] + 2);
+    } else {
+        StrCpy(Base, L"\\");
+    }
+
+    Result[0] = (CHAR16)(L'A' + Drive);
+    Result[1] = L':';
+    Result[2] = 0;
+
+    if (StrLen(Rest) == 0) {
+        StrCpy(Result + 2, Base);
         return TRUE;
     }
 
-    if (IsSep(Input[0])) {
-        if (StrLen(Input) >= MAXP) {
+    if (IsSep(Rest[0])) {
+        if (StrLen(Rest) >= MAXP - 3) {
             return FALSE;
         }
-        StrCpy(Joined, Input);
+        StrCpy(Joined, Rest);
     } else {
-        if (StrLen(gCwd) + StrLen(Input) + 2 >= MAXP) {
+        if (StrLen(Base) + StrLen(Rest) + 2 >= MAXP - 3) {
             return FALSE;
         }
-        StrCpy(Joined, gCwd);
+        StrCpy(Joined, Base);
         StrCat(Joined, L"\\");
-        StrCat(Joined, Input);
+        StrCat(Joined, Rest);
     }
 
-    Result[0] = 0;
     while (Joined[I]) {
         while (IsSep(Joined[I])) {
             I++;
@@ -274,8 +324,8 @@ static BOOLEAN Resolve(CHAR16 *Input, CHAR16 *Result)
         StrCat(Result, Comp);
     }
 
-    if (Result[0] == 0) {
-        StrCpy(Result, L"\\");
+    if (Result[2] == 0) {
+        StrCpy(Result + 2, L"\\");
     }
     return TRUE;
 }
@@ -288,7 +338,7 @@ static BOOLEAN JoinPath(CHAR16 *Dir, CHAR16 *Name, CHAR16 *Result)
         return FALSE;
     }
     StrCpy(Result, Dir);
-    if (!(D == 1 && Dir[0] == L'\\')) {
+    if (D == 0 || Dir[D - 1] != L'\\') {
         StrCat(Result, L"\\");
     }
     StrCat(Result, Name);
@@ -313,17 +363,141 @@ static VOID SplitPath(CHAR16 *Abs, CHAR16 *Parent, CHAR16 *Name)
         I--;
     }
     StrCpy(Name, Abs + I);
-    if (I <= 1) {
-        StrCpy(Parent, L"\\");
+    if (I <= 3) {
+        CopyMem(Parent, Abs, 3 * sizeof(CHAR16));
+        Parent[3] = 0;
     } else {
         CopyMem(Parent, Abs, (I - 1) * sizeof(CHAR16));
         Parent[I - 1] = 0;
     }
 }
 
+static EFI_HANDLE FindFsByPath(UINT8 *Dp, UINTN Len)
+{
+    EFI_HANDLE *H = NULL;
+    EFI_HANDLE R = NULL;
+    EFI_DEVICE_PATH *P;
+    UINTN N = 0;
+    UINTN I;
+
+    if (EFI_ERROR(uefi_call_wrapper(BS->LocateHandleBuffer, 5, ByProtocol, &FileSystemProtocol, NULL, &N, &H)) || H == NULL) {
+        return NULL;
+    }
+    for (I = 0; I < N && R == NULL; I++) {
+        P = DevicePathFromHandle(H[I]);
+        if (P != NULL && DevicePathSize(P) == Len && !CompareMem(P, Dp, Len)) {
+            R = H[I];
+        }
+    }
+    FreePool(H);
+    return R;
+}
+
+static EFI_HANDLE DrvHandle(UINTN D)
+{
+    UINT8 *V;
+    UINTN Sz = 0;
+    UINTN O = 0;
+    UINTN Len;
+    EFI_HANDLE R = NULL;
+
+    if (D >= 26) {
+        return NULL;
+    }
+    if (D == 2) {
+        return gDevice;
+    }
+    V = LibGetVariableAndSize((CHAR16 *)L"IzhOSDrives", &gDrvGuid, &Sz);
+    if (V == NULL) {
+        return NULL;
+    }
+    while (O + 3 <= Sz) {
+        Len = (UINTN)V[O + 1] | ((UINTN)V[O + 2] << 8);
+        if (O + 3 + Len > Sz) {
+            break;
+        }
+        if (V[O] == (UINT8)D) {
+            R = FindFsByPath(V + O + 3, Len);
+            break;
+        }
+        O += 3 + Len;
+    }
+    FreePool(V);
+    return R;
+}
+
+static EFI_FILE_HANDLE DrvRootOf(UINTN D)
+{
+    EFI_HANDLE H;
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Fs = NULL;
+    EFI_FILE_HANDLE R = NULL;
+
+    if (D >= 26) {
+        return NULL;
+    }
+    if (gDrvRoot[D] != NULL) {
+        return gDrvRoot[D];
+    }
+    H = DrvHandle(D);
+    if (H == NULL) {
+        return NULL;
+    }
+    if (EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, H, &FileSystemProtocol, (VOID **)&Fs)) || Fs == NULL) {
+        return NULL;
+    }
+    if (EFI_ERROR(uefi_call_wrapper(Fs->OpenVolume, 2, Fs, &R)) || R == NULL) {
+        return NULL;
+    }
+    gDrvRoot[D] = R;
+    return R;
+}
+
+static VOID DrvFlush(VOID)
+{
+    UINTN D;
+
+    for (D = 0; D < 26; D++) {
+        if (gDrvRoot[D] != NULL) {
+            uefi_call_wrapper(gDrvRoot[D]->Close, 1, gDrvRoot[D]);
+            gDrvRoot[D] = NULL;
+        }
+    }
+}
+
+static BOOLEAN SwitchDrive(UINTN D)
+{
+    if (D == gDrvCur) {
+        return TRUE;
+    }
+    if (DrvRootOf(D) == NULL) {
+        return FALSE;
+    }
+    StrCpy(gDrvCwd[gDrvCur], gCwd);
+    gDrvCur = D;
+    if (gDrvCwd[D][0] != 0) {
+        StrCpy(gCwd, gDrvCwd[D]);
+    } else {
+        gCwd[0] = (CHAR16)(L'A' + D);
+        gCwd[1] = L':';
+        gCwd[2] = L'\\';
+        gCwd[3] = 0;
+    }
+    return TRUE;
+}
+
 static EFI_STATUS OpenAbs(CHAR16 *Path, UINT64 Mode, UINT64 Attr, EFI_FILE_HANDLE *Handle)
 {
-    return uefi_call_wrapper(gRoot->Open, 5, gRoot, Handle, Path, Mode, Attr);
+    INTN D = DriveOf(Path);
+    EFI_FILE_HANDLE R;
+
+    if (D < 0) {
+        return EFI_INVALID_PARAMETER;
+    }
+    R = DrvRootOf((UINTN)D);
+    if (R == NULL) {
+        return EFI_NO_MEDIA;
+    }
+    return uefi_call_wrapper(R->Open, 5, R, Handle, Path + 2, Mode, Attr);
 }
 
 static VOID CloseFile(EFI_FILE_HANDLE File)
@@ -724,6 +898,16 @@ static EFI_STATUS MoveOne(CHAR16 *From, CHAR16 *To)
     if (InsideOrEqual(To, From)) {
         return EFI_INVALID_PARAMETER;
     }
+    if (UpCase(From[0]) != UpCase(To[0])) {
+        if (!Exists(From, &IsDir)) {
+            return EFI_NOT_FOUND;
+        }
+        Status = CopyAny(From, To);
+        if (EFI_ERROR(Status)) {
+            return Status;
+        }
+        return IsDir ? DeleteTree(From) : DeletePath(From);
+    }
 
     Status = OpenAbs(From, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0, &File);
     if (EFI_ERROR(Status)) {
@@ -736,11 +920,11 @@ static EFI_STATUS MoveOne(CHAR16 *From, CHAR16 *To)
     }
     IsDir = (Old->Attribute & EFI_FILE_DIRECTORY) != 0;
 
-    Size = SIZE_OF_EFI_FILE_INFO + StrSize(To);
+    Size = SIZE_OF_EFI_FILE_INFO + StrSize(To + 2);
     New = AllocateZeroPool(Size);
     if (New != NULL) {
         CopyMem(New, Old, SIZE_OF_EFI_FILE_INFO);
-        StrCpy(New->FileName, To);
+        StrCpy(New->FileName, To + 2);
         New->Size = Size;
         Status = uefi_call_wrapper(File->SetInfo, 4, File, &GenericFileInfo, Size, New);
         FreePool(New);
@@ -844,24 +1028,39 @@ static VOID CmdCd(INTN Argc, CHAR16 **Argv)
 {
     CHAR16 Abs[MAXP];
     BOOLEAN IsDir;
+    BOOLEAN Switch = FALSE;
+    INTN A = 1;
+    UINTN D;
 
-    if (Argc < 2) {
+    if (Argc > 1 && !StriCmp(Argv[1], L"/d")) {
+        Switch = TRUE;
+        A = 2;
+    }
+    if (Argc <= A) {
         Print(L"%s\n", gCwd);
         return;
     }
-    if (!Resolve(Argv[1], Abs)) {
+    if (!Resolve(Argv[A], Abs)) {
         Print(L"Path too long\n");
         return;
     }
     if (!Exists(Abs, &IsDir)) {
-        Print(L"%s: %r\n", Argv[1], EFI_NOT_FOUND);
+        Print(L"%s: %r\n", Argv[A], EFI_NOT_FOUND);
         return;
     }
     if (!IsDir) {
-        Print(L"%s: not a directory\n", Argv[1]);
+        Print(L"%s: not a directory\n", Argv[A]);
         return;
     }
-    StrCpy(gCwd, Abs);
+    D = (UINTN)(Abs[0] - L'A');
+    if (D == gDrvCur) {
+        StrCpy(gCwd, Abs);
+    } else {
+        StrCpy(gDrvCwd[D], Abs);
+        if (Switch) {
+            SwitchDrive(D);
+        }
+    }
 }
 
 static VOID CmdDel(INTN Argc, CHAR16 **Argv)
@@ -953,7 +1152,7 @@ static VOID CmdRmdir(INTN Argc, CHAR16 **Argv)
             Print(L"Path too long\n");
             continue;
         }
-        if (!StrCmp(Abs, L"\\")) {
+        if (StrLen(Abs) == 3) {
             Print(L"%s: cannot remove the root directory\n", Argv[A]);
             continue;
         }
@@ -1995,6 +2194,7 @@ static VOID CmdNotepad(INTN Argc, CHAR16 **Argv)
     BOOLEAN Vert;
     UINTN I;
     UINTN Page;
+    INTN PrevMode = ST->ConOut->Mode->Mode;
 
     E = AllocateZeroPool(sizeof(EDITOR));
     if (E == NULL) {
@@ -2002,6 +2202,9 @@ static VOID CmdNotepad(INTN Argc, CHAR16 **Argv)
         return;
     }
 
+    if (PrevMode != 0) {
+        uefi_call_wrapper(ST->ConOut->SetMode, 2, ST->ConOut, (UINTN)0);
+    }
     EdQuery(E);
     if (E->Cols < 30 || E->Rows < 6 || E->Row == NULL || E->Tmp == NULL) {
         Print(L"Console is too small for notepad\n");
@@ -2151,6 +2354,9 @@ static VOID CmdNotepad(INTN Argc, CHAR16 **Argv)
     FreePool(E);
 
     ResetConsole();
+    if (PrevMode != 0) {
+        uefi_call_wrapper(ST->ConOut->SetMode, 2, ST->ConOut, (UINTN)PrevMode);
+    }
     uefi_call_wrapper(ST->ConOut->ClearScreen, 1, ST->ConOut);
 }
 
@@ -2185,17 +2391,31 @@ static BOOLEAN FindExecutable(CHAR16 *Cmd, CHAR16 *Result)
                 return TRUE;
             }
         }
+        if (Resolve(Cmd, Abs) && StrLen(Abs) + 4 < MAXP) {
+            StrCat(Abs, L".bat");
+            if (IsRegular(Abs)) {
+                StrCpy(Result, Abs);
+                return TRUE;
+            }
+        }
     }
 
     if (!HasSep && StrLen(Cmd) + StrLen(SYSTEM_DIR) + 6 < MAXP) {
-        StrCpy(Abs, SYSTEM_DIR);
+        StrCpy(Abs, L"C:" SYSTEM_DIR);
         StrCat(Abs, L"\\");
         StrCat(Abs, Cmd);
         if (IsRegular(Abs)) {
             StrCpy(Result, Abs);
             return TRUE;
         }
+        StrCpy(Result, Abs);
         StrCat(Abs, L".efi");
+        if (IsRegular(Abs)) {
+            StrCpy(Result, Abs);
+            return TRUE;
+        }
+        StrCpy(Abs, Result);
+        StrCat(Abs, L".bat");
         if (IsRegular(Abs)) {
             StrCpy(Result, Abs);
             return TRUE;
@@ -2204,11 +2424,72 @@ static BOOLEAN FindExecutable(CHAR16 *Cmd, CHAR16 *Result)
     return FALSE;
 }
 
+static VOID ProcessSimple(CHAR16 *Line);
+
+static BOOLEAN IsBat(CHAR16 *Path)
+{
+    UINTN Len = StrLen(Path);
+
+    return Len >= 4 && !StriCmp(Path + Len - 4, L".bat");
+}
+
+static VOID RunBat(CHAR16 *Path)
+{
+    UINT8 *Data;
+    UINTN Size;
+    UINTN I;
+    UINTN N;
+    CHAR16 Line[MAXLINE];
+    BOOLEAN Echo = TRUE;
+    EFI_STATUS Status;
+
+    Status = ReadWhole(Path, &Data, &Size);
+    if (EFI_ERROR(Status)) {
+        Print(L"%s: %r\n", Path, Status);
+        return;
+    }
+
+    N = 0;
+    for (I = 0; I <= Size; I++) {
+        if (I == Size || Data[I] == '\n') {
+            while (N > 0 && (Line[N - 1] == L'\r' || Line[N - 1] == L' ' || Line[N - 1] == L'\t')) {
+                N--;
+            }
+            Line[N] = 0;
+            N = 0;
+            if (Line[0] == 0 || Line[0] == L':') {
+                continue;
+            }
+            if (!StriCmp(Line, L"@echo off")) {
+                Echo = FALSE;
+                continue;
+            }
+            if (!StriCmp(Line, L"@echo on") || !StriCmp(Line, L"echo on")) {
+                Echo = TRUE;
+                continue;
+            }
+            if (Echo) {
+                Print(L"%s> %s\n", gCwd, Line);
+            }
+            ProcessSimple(Line[0] == L'@' ? Line + 1 : Line);
+            if (gExit) {
+                break;
+            }
+            continue;
+        }
+        if (Data[I] != '\r' && N + 1 < MAXLINE) {
+            Line[N++] = (CHAR16)Data[I];
+        }
+    }
+    FreePool(Data);
+}
+
 static VOID RunExternal(CHAR16 *Cmd, CHAR16 *Args)
 {
     CHAR16 Path[MAXP];
     EFI_DEVICE_PATH *Dp;
     EFI_HANDLE Image = NULL;
+    EFI_HANDLE Dev;
     EFI_LOADED_IMAGE *Li = NULL;
     EFI_STATUS Status;
     UINTN ExitSize = 0;
@@ -2220,7 +2501,13 @@ static VOID RunExternal(CHAR16 *Cmd, CHAR16 *Args)
         return;
     }
 
-    Dp = FileDevicePath(gDevice, Path);
+    if (IsBat(Path)) {
+        RunBat(Path);
+        return;
+    }
+
+    Dev = DrvHandle((UINTN)DriveOf(Path));
+    Dp = Dev != NULL ? FileDevicePath(Dev, Path + 2) : NULL;
     if (Dp == NULL) {
         Print(L"Out of memory\n");
         return;
@@ -2243,6 +2530,7 @@ static VOID RunExternal(CHAR16 *Cmd, CHAR16 *Args)
         }
     }
 
+    DrvFlush();
     Status = uefi_call_wrapper(BS->StartImage, 3, Image, &ExitSize, &ExitData);
     if (ExitData != NULL) {
         FreePool(ExitData);
@@ -2251,6 +2539,16 @@ static VOID RunExternal(CHAR16 *Cmd, CHAR16 *Args)
         FreePool(Options);
     }
     ResetConsole();
+    if (DrvRootOf(gDrvCur) == NULL) {
+        StrCpy(gDrvCwd[gDrvCur], gCwd);
+        gDrvCur = 2;
+        if (gDrvCwd[2][0] != 0) {
+            StrCpy(gCwd, gDrvCwd[2]);
+        } else {
+            StrCpy(gCwd, L"C:\\");
+        }
+        Print(L"Current drive was removed, switched to C:\n");
+    }
     if (EFI_ERROR(Status)) {
         Print(L"\n%s exited with status: %r\n", Cmd, Status);
     }
@@ -2560,16 +2858,49 @@ static VOID CmdClock(BOOLEAN Date)
     }
 }
 
-static VOID CmdVol(VOID)
+static VOID CmdVol(INTN Argc, CHAR16 **Argv)
 {
-    EFI_FILE_SYSTEM_INFO *Info = LibFileSystemInfo(gRoot);
+    INTN D = (INTN)gDrvCur;
+    EFI_FILE_HANDLE R;
+    EFI_FILE_SYSTEM_INFO *Info;
 
+    if (Argc > 1) {
+        D = DriveOf(Argv[1]);
+        if (D < 0) {
+            Print(L"Invalid drive\n");
+            return;
+        }
+    }
+    R = DrvRootOf((UINTN)D);
+    Info = R != NULL ? LibFileSystemInfo(R) : NULL;
     if (Info == NULL) {
-        Print(L"Volume information unavailable\n");
+        Print(L"Drive not available\n");
         return;
     }
-    Print(L"Label: %s\nSize:  %lu bytes\nFree:  %lu bytes\n", Info->VolumeLabel, Info->VolumeSize, Info->FreeSpace);
+    Print(L"Drive: %c:\nLabel: %s\nSize:  %lu bytes\nFree:  %lu bytes\n", (CHAR16)(L'A' + D), Info->VolumeLabel, Info->VolumeSize, Info->FreeSpace);
     FreePool(Info);
+}
+
+static VOID CmdDrives(VOID)
+{
+    UINTN D;
+    EFI_FILE_HANDLE R;
+    EFI_FILE_SYSTEM_INFO *Info;
+
+    for (D = 0; D < 26; D++) {
+        if (DrvHandle(D) == NULL) {
+            continue;
+        }
+        R = DrvRootOf(D);
+        Info = R != NULL ? LibFileSystemInfo(R) : NULL;
+        Print(L"%c:%s ", (CHAR16)(L'A' + D), D == gDrvCur ? L"*" : L" ");
+        if (Info != NULL) {
+            Print(L"\"%s\"  %lu MB  free %lu MB\n", Info->VolumeLabel, Info->VolumeSize >> 20, Info->FreeSpace >> 20);
+            FreePool(Info);
+        } else {
+            Print(L"not mounted\n");
+        }
+    }
 }
 
 static VOID CmdColor(INTN Argc, CHAR16 **Argv)
@@ -2601,7 +2932,9 @@ static VOID CmdHelp(VOID)
 {
     Print(L"IzhOS Command Shell %s\n\n", SHELL_VERSION);
     Print(L"  dir [path|pattern]        list directory contents\n");
-    Print(L"  cd [path]                 change or show current directory\n");
+    Print(L"  cd [/d] [path]            change or show current directory\n");
+    Print(L"  X:                        switch drive (C: is the system drive)\n");
+    Print(L"  drives                    list mounted drive letters\n");
     Print(L"  type <file>               print a file\n");
     Print(L"  copy <src> <dst>          copy files or directories\n");
     Print(L"  move <src> <dst>          move or rename files or directories\n");
@@ -2620,7 +2953,7 @@ static VOID CmdHelp(VOID)
     Print(L"  hex <file> [bytes]        hex dump\n");
     Print(L"  mem                       memory usage\n");
     Print(L"  date / time               show date or time\n");
-    Print(L"  vol                       volume label and space\n");
+    Print(L"  vol [X:]                  volume label and space\n");
     Print(L"  color [fg] [bg]           set text colors (0-15, 0-7)\n");
     Print(L"  sleep [seconds]           wait\n");
     Print(L"  pause                     wait for a key\n");
@@ -2711,7 +3044,11 @@ static VOID ProcessSimple(CHAR16 *Line)
         return;
     }
 
-    if (!StriCmp(Argv[0], L"dir")) {
+    if (Argc == 1 && StrLen(Argv[0]) == 2 && DriveOf(Argv[0]) >= 0) {
+        if (!SwitchDrive((UINTN)DriveOf(Argv[0]))) {
+            Print(L"Drive not available\n");
+        }
+    } else if (!StriCmp(Argv[0], L"dir")) {
         CmdDir(Argc, Argv);
     } else if (!StriCmp(Argv[0], L"cd") || !StriCmp(Argv[0], L"chdir")) {
         CmdCd(Argc, Argv);
@@ -2735,6 +3072,8 @@ static VOID ProcessSimple(CHAR16 *Line)
         CmdNotepad(Argc, Argv);
     } else if (!StriCmp(Argv[0], L"ren") || !StriCmp(Argv[0], L"rename")) {
         CmdRen(Argc, Argv);
+    } else if (!StriCmp(Argv[0], L"drives")) {
+        CmdDrives();
     } else if (!StriCmp(Argv[0], L"pwd")) {
         Print(L"%s\n", gCwd);
     } else if (!StriCmp(Argv[0], L"tree")) {
@@ -2756,7 +3095,7 @@ static VOID ProcessSimple(CHAR16 *Line)
     } else if (!StriCmp(Argv[0], L"time")) {
         CmdClock(FALSE);
     } else if (!StriCmp(Argv[0], L"vol")) {
-        CmdVol();
+        CmdVol(Argc, Argv);
     } else if (!StriCmp(Argv[0], L"pause")) {
         Print(L"Press any key to continue . . .");
         GetKey();
@@ -3470,7 +3809,6 @@ static VOID ReadLine(CHAR16 *Buf, UINTN Max)
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 {
     EFI_LOADED_IMAGE *Loaded = NULL;
-    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Fs = NULL;
     CHAR16 Line[MAXLINE];
     EFI_STATUS Status;
 
@@ -3484,21 +3822,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
     gDevice = Loaded->DeviceHandle;
 
-    Status = uefi_call_wrapper(BS->HandleProtocol, 3, gDevice, &FileSystemProtocol, (VOID **)&Fs);
-    if (EFI_ERROR(Status) || Fs == NULL) {
-        Print(L"Command: boot device has no file system: %r\n", Status);
-        return Status;
-    }
-    Status = uefi_call_wrapper(Fs->OpenVolume, 2, Fs, &gRoot);
-    if (EFI_ERROR(Status)) {
-        Print(L"Command: cannot open volume: %r\n", Status);
-        return Status;
+    if (DrvRootOf(2) == NULL) {
+        Print(L"Command: cannot open the system volume\n");
+        return EFI_NOT_FOUND;
     }
 
-    StrCpy(gCwd, L"\\");
+    StrCpy(gCwd, L"C:\\");
     ResetConsole();
     Print(L"IzhOS Command Shell %s\n", SHELL_VERSION);
     Print(L"Type help for a list of commands.\n\n");
+
+    if (IsRegular(L"C:\\Autoexec.bat")) {
+        RunBat(L"C:\\Autoexec.bat");
+    }
 
     while (!gExit) {
         Print(L"%s> ", gCwd);
@@ -3507,6 +3843,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         Process(Line);
     }
 
-    CloseFile(gRoot);
+    DrvFlush();
     return EFI_SUCCESS;
 }

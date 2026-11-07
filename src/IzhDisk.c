@@ -30,6 +30,16 @@ typedef struct {
     UINT64 Start;
 } TargetInfo;
 
+typedef struct {
+    UINT32 Major;
+    UINT32 Minor;
+    EFI_HANDLE BootDevice;
+    EFI_HANDLE KernelImage;
+} KINFO;
+
+static EFI_GUID gDrvGuid = { 0x7a1c5e43, 0x3b9d, 0x4f08, { 0x9e, 0x61, 0x2d, 0xc4, 0xa8, 0x53, 0x17, 0xb0 } };
+static EFI_GUID gKernGuid = { 0x7a1c5e42, 0x3b9d, 0x4f08, { 0x9e, 0x61, 0x2d, 0xc4, 0xa8, 0x53, 0x17, 0xb0 } };
+static EFI_DEVICE_PATH *gBootDp;
 static DiskInfo gDisks[MAXDISKS];
 static PartInfo gParts[MAXPARTS];
 static UINTN gDiskCount;
@@ -64,6 +74,159 @@ static VOID Put32(UINT8 *B, UINTN O, UINT32 V)
     B[O + 1] = (UINT8)(V >> 8);
     B[O + 2] = (UINT8)(V >> 16);
     B[O + 3] = (UINT8)(V >> 24);
+}
+
+static BOOLEAN SamePath(EFI_DEVICE_PATH *A, UINT8 *B, UINTN Len)
+{
+    return A != NULL && DevicePathSize(A) == Len && !CompareMem(A, B, Len);
+}
+
+static INTN DrvOfHandle(EFI_HANDLE H)
+{
+    EFI_DEVICE_PATH *Dp;
+    UINT8 *V;
+    UINTN Sz = 0;
+    UINTN O = 0;
+    UINTN Len;
+    INTN R = -1;
+
+    if (H == NULL) {
+        return -1;
+    }
+    Dp = DevicePathFromHandle(H);
+    if (Dp == NULL) {
+        return -1;
+    }
+    if (gBootDp != NULL && SamePath(Dp, (UINT8 *)gBootDp, DevicePathSize(gBootDp))) {
+        return 2;
+    }
+    V = LibGetVariableAndSize((CHAR16 *)L"IzhOSDrives", &gDrvGuid, &Sz);
+    if (V == NULL) {
+        return -1;
+    }
+    while (O + 3 <= Sz) {
+        Len = (UINTN)V[O + 1] | ((UINTN)V[O + 2] << 8);
+        if (O + 3 + Len > Sz) {
+            break;
+        }
+        if (V[O] < 26 && SamePath(Dp, V + O + 3, Len)) {
+            R = V[O];
+            break;
+        }
+        O += 3 + Len;
+    }
+    FreePool(V);
+    return R;
+}
+
+static UINT32 DrvMask(VOID)
+{
+    UINT8 *V;
+    UINTN Sz = 0;
+    UINTN O = 0;
+    UINTN Len;
+    UINT32 M = 1 << 2;
+
+    V = LibGetVariableAndSize((CHAR16 *)L"IzhOSDrives", &gDrvGuid, &Sz);
+    if (V == NULL) {
+        return M;
+    }
+    while (O + 3 <= Sz) {
+        Len = (UINTN)V[O + 1] | ((UINTN)V[O + 2] << 8);
+        if (O + 3 + Len > Sz) {
+            break;
+        }
+        if (V[O] < 26) {
+            M |= (UINT32)1 << V[O];
+        }
+        O += 3 + Len;
+    }
+    FreePool(V);
+    return M;
+}
+
+static INTN FreeLetter(VOID)
+{
+    UINT32 M = DrvMask();
+    INTN I;
+
+    for (I = 3; I < 26; I++) {
+        if (!(M & ((UINT32)1 << I))) {
+            return I;
+        }
+    }
+    return -1;
+}
+
+static EFI_STATUS DrvUpdate(EFI_HANDLE DropH, INTN AddL, EFI_HANDLE AddH)
+{
+    EFI_DEVICE_PATH *Dd = DropH != NULL ? DevicePathFromHandle(DropH) : NULL;
+    EFI_DEVICE_PATH *Da = AddH != NULL ? DevicePathFromHandle(AddH) : NULL;
+    UINTN DaL = Da != NULL ? DevicePathSize(Da) : 0;
+    UINT8 *V;
+    UINT8 *N;
+    UINTN Sz = 0;
+    UINTN O = 0;
+    UINTN M = 0;
+    UINTN Len;
+    BOOLEAN Keep;
+    EFI_STATUS S;
+
+    V = LibGetVariableAndSize((CHAR16 *)L"IzhOSDrives", &gDrvGuid, &Sz);
+    N = AllocateZeroPool(Sz + DaL + 16);
+    if (N == NULL) {
+        if (V != NULL) {
+            FreePool(V);
+        }
+        return EFI_OUT_OF_RESOURCES;
+    }
+    while (V != NULL && O + 3 <= Sz) {
+        Len = (UINTN)V[O + 1] | ((UINTN)V[O + 2] << 8);
+        if (O + 3 + Len > Sz) {
+            break;
+        }
+        Keep = TRUE;
+        if (AddL >= 0 && V[O] == (UINT8)AddL) {
+            Keep = FALSE;
+        }
+        if (SamePath(Dd, V + O + 3, Len) || SamePath(Da, V + O + 3, Len)) {
+            Keep = FALSE;
+        }
+        if (Keep) {
+            CopyMem(N + M, V + O, 3 + Len);
+            M += 3 + Len;
+        }
+        O += 3 + Len;
+    }
+    if (AddL >= 0 && Da != NULL) {
+        N[M] = (UINT8)AddL;
+        N[M + 1] = (UINT8)DaL;
+        N[M + 2] = (UINT8)(DaL >> 8);
+        CopyMem(N + M + 3, Da, DaL);
+        M += 3 + DaL;
+    }
+    S = uefi_call_wrapper(RT->SetVariable, 5, (CHAR16 *)L"IzhOSDrives", &gDrvGuid, (UINT32)6, M, N);
+    if (M == 0 && S == EFI_NOT_FOUND) {
+        S = EFI_SUCCESS;
+    }
+    FreePool(N);
+    if (V != NULL) {
+        FreePool(V);
+    }
+    return S;
+}
+
+static INTN LetterOf(CHAR16 *S)
+{
+    CHAR16 C = S[0];
+
+    if (C >= L'a' && C <= L'z') {
+        C = (CHAR16)(C - 32);
+    }
+    if (C >= L'A' && C <= L'Z' && (S[1] == 0 || (S[1] == L':' && S[2] == 0))) {
+        return (INTN)(C - L'A');
+    }
+    return -1;
 }
 
 static UINT32 Crc32(UINT8 *D, UINTN N)
@@ -348,9 +511,36 @@ static BOOLEAN GetTarget(CHAR16 *Arg, TargetInfo *T)
     UINTN D;
     UINTN I;
     INTN P;
+    INTN L = LetterOf(Arg);
 
+    if (L >= 0) {
+        for (I = 0; I < gPartCount; I++) {
+            if (DrvOfHandle(gParts[I].H) == L) {
+                T->Disk = gParts[I].Disk;
+                T->IsPart = TRUE;
+                T->Num = gParts[I].Num;
+                T->Start = gParts[I].Start;
+                T->H = gParts[I].H;
+                T->Bio = gParts[I].Bio;
+                return TRUE;
+            }
+        }
+        for (I = 0; I < gDiskCount; I++) {
+            if (gDisks[I].Parts == 0 && DrvOfHandle(gDisks[I].H) == L) {
+                T->Disk = I;
+                T->IsPart = FALSE;
+                T->Num = 0;
+                T->Start = 0;
+                T->H = gDisks[I].H;
+                T->Bio = gDisks[I].Bio;
+                return TRUE;
+            }
+        }
+        Print(L"Drive %c: is not assigned\n", (CHAR16)(L'A' + L));
+        return FALSE;
+    }
     if (!ParseTarget(Arg, &D, &P) || D >= gDiskCount) {
-        Print(L"Invalid target. Use <disk> or <disk>:<part> (see listdisk, listpar)\n");
+        Print(L"Invalid target. Use <disk>, <disk>:<part> or X: (see listdisk, listpar, listvol)\n");
         return FALSE;
     }
     T->Disk = D;
@@ -384,6 +574,22 @@ static VOID Cell(CONST CHAR16 *S, UINTN W)
     while (L++ < W) {
         Print(L" ");
     }
+}
+
+static VOID InitBoot(EFI_HANDLE Image)
+{
+    KINFO *K = NULL;
+    EFI_LOADED_IMAGE *Li = NULL;
+    EFI_HANDLE H = NULL;
+    EFI_DEVICE_PATH *Dp;
+
+    if (!EFI_ERROR(uefi_call_wrapper(BS->LocateProtocol, 3, &gKernGuid, NULL, (VOID **)&K)) && K != NULL) {
+        H = K->BootDevice;
+    } else if (!EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, Image, &LoadedImageProtocol, (VOID **)&Li)) && Li != NULL) {
+        H = Li->DeviceHandle;
+    }
+    Dp = H != NULL ? DevicePathFromHandle(H) : NULL;
+    gBootDp = Dp != NULL ? DuplicateDevicePath(Dp) : NULL;
 }
 
 static VOID ConnectAll(VOID)
@@ -466,6 +672,42 @@ static VOID CmdListDisk(VOID)
     }
 }
 
+static VOID VolStr(EFI_HANDLE H)
+{
+    INTN L = DrvOfHandle(H);
+
+    if (L < 0) {
+        Print(L"-");
+    } else {
+        Print(L"%c:", (CHAR16)(L'A' + L));
+    }
+}
+
+static VOID CmdListVol(VOID)
+{
+    INTN L;
+    UINTN I;
+    BOOLEAN Any = FALSE;
+
+    for (L = 0; L < 26; L++) {
+        for (I = 0; I < gPartCount; I++) {
+            if (DrvOfHandle(gParts[I].H) == L) {
+                Print(L"%c:  %d:%d  %s\n", (CHAR16)(L'A' + L), (INTN)gParts[I].Disk, (INTN)gParts[I].Num, FsName(gParts[I].Bio));
+                Any = TRUE;
+            }
+        }
+        for (I = 0; I < gDiskCount; I++) {
+            if (gDisks[I].Parts == 0 && DrvOfHandle(gDisks[I].H) == L) {
+                Print(L"%c:  %d    %s\n", (CHAR16)(L'A' + L), (INTN)I, FsName(gDisks[I].Bio));
+                Any = TRUE;
+            }
+        }
+    }
+    if (!Any) {
+        Print(L"No drive letters assigned\n");
+    }
+}
+
 static VOID CmdListPar(INTN Argc, CHAR16 **Argv)
 {
     UINTN D = 0;
@@ -489,10 +731,12 @@ static VOID CmdListPar(INTN Argc, CHAR16 **Argv)
         }
         Print(L"Disk %d  table: %s  partitions: %d\n", (INTN)Di, TableName(gDisks[Di].Bio), (INTN)gDisks[Di].Parts);
         if (gDisks[Di].Parts == 0) {
-            Print(L"  no partitions, file system: %s\n", FsName(gDisks[Di].Bio));
+            Print(L"  no partitions, file system: %s  vol: ", FsName(gDisks[Di].Bio));
+            VolStr(gDisks[Di].H);
+            Print(L"\n");
             continue;
         }
-        Print(L"  Part  Start LBA     Size          FS\n");
+        Print(L"  Part  Start LBA     Size          FS     Vol\n");
         for (I = 0; I < gPartCount; I++) {
             if (gParts[I].Disk != Di) {
                 continue;
@@ -504,12 +748,14 @@ static VOID CmdListPar(INTN Argc, CHAR16 **Argv)
             SPrint(Num, sizeof(Num), L"%lu", gParts[I].Start);
             Cell(Num, 14);
             Cell(Sz, 14);
-            Print(L"%s\n", FsName(gParts[I].Bio));
+            Cell(FsName(gParts[I].Bio), 7);
+            VolStr(gParts[I].H);
+            Print(L"\n");
         }
     }
 }
 
-static VOID MountOne(EFI_HANDLE H, UINTN Disk, INTN Num)
+static VOID MountOne(EFI_HANDLE H, UINTN Disk, INTN Num, INTN Letter)
 {
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Fs = NULL;
     EFI_FILE_HANDLE Root = NULL;
@@ -517,6 +763,8 @@ static VOID MountOne(EFI_HANDLE H, UINTN Disk, INTN Num)
     CHAR16 Name[24];
     CHAR16 A[48];
     CHAR16 B[48];
+    INTN Cur;
+    INTN L;
 
     if (Num < 0) {
         SPrint(Name, sizeof(Name), L"%d", (INTN)Disk);
@@ -532,14 +780,41 @@ static VOID MountOne(EFI_HANDLE H, UINTN Disk, INTN Num)
         Print(L"%s  file system present but cannot open volume\n", Name);
         return;
     }
+    Cur = DrvOfHandle(H);
+    if (Cur == 2) {
+        L = 2;
+    } else if (Letter == 2) {
+        Print(L"%s  C: is reserved for the system volume\n", Name);
+        uefi_call_wrapper(Root->Close, 1, Root);
+        return;
+    } else if (Letter >= 0) {
+        if ((DrvMask() & ((UINT32)1 << Letter)) && Cur != Letter) {
+            Print(L"%s  %c: is already in use\n", Name, (CHAR16)(L'A' + Letter));
+            uefi_call_wrapper(Root->Close, 1, Root);
+            return;
+        }
+        L = Letter;
+    } else if (Cur >= 0) {
+        L = Cur;
+    } else {
+        L = FreeLetter();
+    }
+    if (L < 0) {
+        Print(L"%s  no free drive letter\n", Name);
+        uefi_call_wrapper(Root->Close, 1, Root);
+        return;
+    }
+    if (L != 2) {
+        DrvUpdate(NULL, L, H);
+    }
     Info = LibFileSystemInfo(Root);
     if (Info != NULL) {
         SizeStr(Info->VolumeSize, A);
         SizeStr(Info->FreeSpace, B);
-        Print(L"%s  mounted  label \"%s\"  size %s  free %s\n", Name, Info->VolumeLabel, A, B);
+        Print(L"%s  %c:  mounted  label \"%s\"  size %s  free %s\n", Name, (CHAR16)(L'A' + L), Info->VolumeLabel, A, B);
         FreePool(Info);
     } else {
-        Print(L"%s  mounted\n", Name);
+        Print(L"%s  %c:  mounted\n", Name, (CHAR16)(L'A' + L));
     }
     uefi_call_wrapper(Root->Close, 1, Root);
 }
@@ -549,29 +824,57 @@ static VOID CmdMount(INTN Argc, CHAR16 **Argv)
     TargetInfo T;
     UINTN I;
     UINTN Found = 0;
+    INTN Letter = -1;
 
     if (Argc < 2) {
-        Print(L"Usage: mount <disk>[:<part>]\n");
+        Print(L"Usage: mount <disk>[:<part>] [X:]\n");
         return;
+    }
+    if (Argc > 2) {
+        Letter = LetterOf(Argv[2]);
+        if (Letter < 0) {
+            Print(L"Invalid drive letter\n");
+            return;
+        }
     }
     if (!GetTarget(Argv[1], &T)) {
         return;
     }
     if (T.IsPart) {
-        MountOne(T.H, T.Disk, (INTN)T.Num);
+        MountOne(T.H, T.Disk, (INTN)T.Num, Letter);
         return;
     }
     uefi_call_wrapper(BS->ConnectController, 4, T.H, NULL, NULL, TRUE);
     Scan();
     for (I = 0; I < gPartCount; I++) {
         if (gParts[I].Disk == T.Disk) {
-            MountOne(gParts[I].H, T.Disk, (INTN)gParts[I].Num);
             Found++;
         }
     }
-    if (Found == 0) {
-        MountOne(gDisks[T.Disk].H, T.Disk, -1);
+    if (Found > 1 && Letter >= 0) {
+        Print(L"Disk has %d partitions; use mount %d:<part> %c:\n", (INTN)Found, (INTN)T.Disk, (CHAR16)(L'A' + Letter));
+        return;
     }
+    for (I = 0; I < gPartCount; I++) {
+        if (gParts[I].Disk == T.Disk) {
+            MountOne(gParts[I].H, T.Disk, (INTN)gParts[I].Num, Letter);
+        }
+    }
+    if (Found == 0) {
+        MountOne(gDisks[T.Disk].H, T.Disk, -1, Letter);
+    }
+}
+
+static VOID DropDisk(UINTN Disk)
+{
+    UINTN I;
+
+    for (I = 0; I < gPartCount; I++) {
+        if (gParts[I].Disk == Disk) {
+            DrvUpdate(gParts[I].H, -1, NULL);
+        }
+    }
+    DrvUpdate(gDisks[Disk].H, -1, NULL);
 }
 
 static VOID CmdUnmount(INTN Argc, CHAR16 **Argv)
@@ -579,15 +882,17 @@ static VOID CmdUnmount(INTN Argc, CHAR16 **Argv)
     TargetInfo T;
 
     if (Argc < 2) {
-        Print(L"Usage: unmount <disk>[:<part>]\n");
+        Print(L"Usage: unmount <disk>[:<part>|X:]\n");
         return;
     }
     if (!GetTarget(Argv[1], &T)) {
         return;
     }
     if (T.IsPart) {
+        DrvUpdate(T.H, -1, NULL);
         StopFs(T.H);
     } else {
+        DropDisk(T.Disk);
         Release(T.Disk);
     }
     Print(L"Unmounted %s\n", Argv[1]);
@@ -722,6 +1027,7 @@ static VOID CmdDelete(INTN Argc, CHAR16 **Argv)
         Print(L"Aborted\n");
         return;
     }
+    DrvUpdate(T.H, -1, NULL);
     Release(T.Disk);
     S = DeletePart(D->Bio, T.Num);
     Flush(D->Bio);
@@ -811,6 +1117,7 @@ static VOID CmdZero(INTN Argc, CHAR16 **Argv)
         Print(L"Aborted\n");
         return;
     }
+    DropDisk(T.Disk);
     Release(T.Disk);
     if (gQuick) {
         Edge = (UINT64)1048576 / B->Media->BlockSize;
@@ -1017,15 +1324,17 @@ static VOID CmdFrmt(INTN Argc, CHAR16 **Argv)
 
 static VOID CmdHelp(VOID)
 {
-    Print(L"IzhDisk 1.0\n\n");
+    Print(L"IzhDisk 1.5\n\n");
     Print(L"  listdisk                       list disks\n");
     Print(L"  listpar [disk]                 list partitions\n");
-    Print(L"  mount <disk>[:<part>]          connect drivers and mount file systems\n");
-    Print(L"  unmount <disk>[:<part>]        disconnect file system drivers\n");
+    Print(L"  listvol                        list drive letters\n");
+    Print(L"  mount <disk>[:<part>] [X:]     mount and assign a drive letter (D: and up)\n");
+    Print(L"  unmount <disk>[:<part>|X:]     unmount and free the drive letter\n");
     Print(L"  delete <disk>:<part>           remove a partition (MBR or GPT)\n");
     Print(L"  zero <disk> [/q]               overwrite a disk with zeros (/q: ends only)\n");
     Print(L"  frmt <disk>[:<part>] [label]   format as FAT32\n");
     Print(L"  exit                           leave IzhDisk\n\n");
+    Print(L"  X: can be used instead of <disk>:<part> once a letter is assigned\n");
     Print(L"  /y skips the confirmation prompt\n");
 }
 
@@ -1076,6 +1385,8 @@ static BOOLEAN Process(CHAR16 *Line)
         CmdListDisk();
     } else if (!StriCmp(Argv[0], L"listpar")) {
         CmdListPar(Argc, Argv);
+    } else if (!StriCmp(Argv[0], L"listvol")) {
+        CmdListVol();
     } else if (!StriCmp(Argv[0], L"mount")) {
         CmdMount(Argc, Argv);
     } else if (!StriCmp(Argv[0], L"unmount")) {
@@ -1133,6 +1444,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
     InitializeLib(ImageHandle, SystemTable);
     ConnectAll();
+    InitBoot(ImageHandle);
 
     if (!EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, ImageHandle, &LoadedImageProtocol, (VOID **)&Li)) && Li != NULL && Li->LoadOptions != NULL && Li->LoadOptionsSize >= 4) {
         StrnCpy(Line, (CHAR16 *)Li->LoadOptions, MAXLINE - 1);
