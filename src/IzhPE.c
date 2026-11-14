@@ -1,0 +1,688 @@
+#include <efi.h>
+#include <efilib.h>
+
+#define MAXDISKS 32
+#define MAXPARTS 128
+#define SYSTEM_DIR L"\\IzhOS\\System"
+
+typedef struct {
+    EFI_HANDLE H;
+    EFI_BLOCK_IO *Bio;
+    UINTN Parts;
+} DiskInfo;
+
+typedef struct {
+    EFI_HANDLE H;
+    EFI_BLOCK_IO *Bio;
+    UINTN Disk;
+    UINT32 Num;
+    UINT64 Start;
+    UINT64 Size;
+} PartInfo;
+
+static DiskInfo gDisks[MAXDISKS];
+static PartInfo gParts[MAXPARTS];
+static UINTN gDiskCount;
+static UINTN gPartCount;
+static EFI_HANDLE gSelfDevice;
+
+static UINT32 Get32(UINT8 *B, UINTN O)
+{
+    return (UINT32)B[O] | ((UINT32)B[O + 1] << 8) | ((UINT32)B[O + 2] << 16) | ((UINT32)B[O + 3] << 24);
+}
+
+static UINT64 Get64(UINT8 *B, UINTN O)
+{
+    return (UINT64)Get32(B, O) | ((UINT64)Get32(B, O + 4) << 32);
+}
+
+static EFI_STATUS Rd(EFI_BLOCK_IO *B, UINT64 Lba, UINTN Bytes, VOID *Buf)
+{
+    return uefi_call_wrapper(B->ReadBlocks, 5, B, B->Media->MediaId, Lba, Bytes, Buf);
+}
+
+static EFI_STATUS Wr(EFI_BLOCK_IO *B, UINT64 Lba, UINTN Bytes, VOID *Buf)
+{
+    return uefi_call_wrapper(B->WriteBlocks, 5, B, B->Media->MediaId, Lba, Bytes, Buf);
+}
+
+static EFI_INPUT_KEY GetKey(VOID)
+{
+    EFI_INPUT_KEY K;
+    UINTN Index;
+
+    for (;;) {
+        if (!EFI_ERROR(uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &K))) {
+            return K;
+        }
+        uefi_call_wrapper(BS->WaitForEvent, 3, (UINTN)1, &ST->ConIn->WaitForKey, &Index);
+    }
+}
+
+static VOID ReadLine(CHAR16 *Buf, UINTN Max)
+{
+    UINTN Len = 0;
+    EFI_INPUT_KEY K;
+    CHAR16 One[2];
+
+    Buf[0] = 0;
+    for (;;) {
+        K = GetKey();
+        if (K.UnicodeChar == L'\r' || K.UnicodeChar == L'\n') {
+            Print(L"\n");
+            return;
+        }
+        if (K.UnicodeChar == 8) {
+            if (Len > 0) {
+                Len--;
+                Buf[Len] = 0;
+                Print(L"\b \b");
+            }
+            continue;
+        }
+        if (K.UnicodeChar >= 32 && Len + 1 < Max) {
+            Buf[Len++] = K.UnicodeChar;
+            Buf[Len] = 0;
+            One[0] = K.UnicodeChar;
+            One[1] = 0;
+            Print(L"%s", One);
+        }
+    }
+}
+
+static BOOLEAN ReadNum(CHAR16 *Prompt, UINTN Max, UINTN *Out)
+{
+    CHAR16 Line[32];
+    UINTN V = 0;
+    UINTN I;
+
+    Print(L"%s", Prompt);
+    ReadLine(Line, 32);
+    if (Line[0] == 0) {
+        return FALSE;
+    }
+    for (I = 0; Line[I]; I++) {
+        if (Line[I] < L'0' || Line[I] > L'9') {
+            return FALSE;
+        }
+        V = V * 10 + (UINTN)(Line[I] - L'0');
+    }
+    if (V >= Max) {
+        return FALSE;
+    }
+    *Out = V;
+    return TRUE;
+}
+
+static BOOLEAN Confirm(VOID)
+{
+    EFI_INPUT_KEY K;
+
+    Print(L" continue? [y/N] ");
+    K = GetKey();
+    Print(L"%c\n", K.UnicodeChar >= 32 ? K.UnicodeChar : L' ');
+    return K.UnicodeChar == L'y' || K.UnicodeChar == L'Y';
+}
+
+static VOID Cell(CHAR16 *S, UINTN W)
+{
+    UINTN L = StrLen(S);
+
+    Print(L"%s", S);
+    while (L++ < W) {
+        Print(L" ");
+    }
+}
+
+static VOID SizeStr(UINT64 B, CHAR16 *Out)
+{
+    if (B >= ((UINT64)1 << 30)) {
+        SPrint(Out, 48, L"%lu.%02lu GB", B >> 30, ((B & 0x3FFFFFFF) * 100) >> 30);
+    } else if (B >= ((UINT64)1 << 20)) {
+        SPrint(Out, 48, L"%lu.%02lu MB", B >> 20, ((B & 0xFFFFF) * 100) >> 20);
+    } else {
+        SPrint(Out, 48, L"%lu KB", B >> 10);
+    }
+}
+
+static BOOLEAN PathInfo(EFI_DEVICE_PATH *Dp, EFI_DEVICE_PATH **Node, UINT32 *Num, UINT64 *Start, UINT64 *Size)
+{
+    EFI_DEVICE_PATH *N = Dp;
+    HARDDRIVE_DEVICE_PATH *Hd;
+
+    while (!IsDevicePathEnd(N)) {
+        if (DevicePathType(N) == MEDIA_DEVICE_PATH && DevicePathSubType(N) == MEDIA_HARDDRIVE_DP) {
+            Hd = (HARDDRIVE_DEVICE_PATH *)N;
+            *Node = N;
+            *Num = Hd->PartitionNumber;
+            *Start = Hd->PartitionStart;
+            *Size = Hd->PartitionSize;
+            return TRUE;
+        }
+        N = NextDevicePathNode(N);
+    }
+    return FALSE;
+}
+
+static UINTN DpLen(EFI_DEVICE_PATH *Dp)
+{
+    return DevicePathSize(Dp) - sizeof(EFI_DEVICE_PATH);
+}
+
+static BOOLEAN GetBio(EFI_HANDLE H, EFI_BLOCK_IO **B)
+{
+    *B = NULL;
+    if (EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, H, &BlockIoProtocol, (VOID **)B))) {
+        return FALSE;
+    }
+    return *B != NULL && (*B)->Media != NULL;
+}
+
+static VOID ConnectAll(VOID)
+{
+    EFI_HANDLE *H = NULL;
+    UINTN N = 0;
+    UINTN I;
+
+    if (EFI_ERROR(uefi_call_wrapper(BS->LocateHandleBuffer, 5, AllHandles, NULL, NULL, &N, &H)) || H == NULL) {
+        return;
+    }
+    for (I = 0; I < N; I++) {
+        uefi_call_wrapper(BS->ConnectController, 4, H[I], NULL, NULL, TRUE);
+    }
+    FreePool(H);
+}
+
+static VOID Scan(VOID)
+{
+    EFI_HANDLE *H = NULL;
+    UINTN N = 0;
+    UINTN I;
+    UINTN J;
+    UINTN Prefix;
+    EFI_BLOCK_IO *B;
+    EFI_DEVICE_PATH *Dp;
+    EFI_DEVICE_PATH *Dd;
+    EFI_DEVICE_PATH *Node;
+    UINT32 Num;
+    UINT64 Start;
+    UINT64 Size;
+
+    gDiskCount = 0;
+    gPartCount = 0;
+    if (EFI_ERROR(uefi_call_wrapper(BS->LocateHandleBuffer, 5, ByProtocol, &BlockIoProtocol, NULL, &N, &H)) || H == NULL) {
+        return;
+    }
+    for (I = 0; I < N; I++) {
+        if (!GetBio(H[I], &B) || B->Media->LogicalPartition || gDiskCount >= MAXDISKS) {
+            continue;
+        }
+        gDisks[gDiskCount].H = H[I];
+        gDisks[gDiskCount].Bio = B;
+        gDisks[gDiskCount].Parts = 0;
+        gDiskCount++;
+    }
+    for (I = 0; I < N; I++) {
+        if (!GetBio(H[I], &B) || !B->Media->LogicalPartition || gPartCount >= MAXPARTS) {
+            continue;
+        }
+        Dp = DevicePathFromHandle(H[I]);
+        if (Dp == NULL || !PathInfo(Dp, &Node, &Num, &Start, &Size)) {
+            continue;
+        }
+        Prefix = (UINTN)((UINT8 *)Node - (UINT8 *)Dp);
+        for (J = 0; J < gDiskCount; J++) {
+            Dd = DevicePathFromHandle(gDisks[J].H);
+            if (Dd != NULL && DpLen(Dd) == Prefix && !CompareMem(Dd, Dp, Prefix)) {
+                gParts[gPartCount].H = H[I];
+                gParts[gPartCount].Bio = B;
+                gParts[gPartCount].Disk = J;
+                gParts[gPartCount].Num = Num;
+                gParts[gPartCount].Start = Start;
+                gParts[gPartCount].Size = Size;
+                gPartCount++;
+                gDisks[J].Parts++;
+                break;
+            }
+        }
+    }
+    FreePool(H);
+}
+
+static CONST CHAR16 *FsName(EFI_BLOCK_IO *B)
+{
+    UINT32 Bs = B->Media->BlockSize;
+    UINT8 *S;
+    CONST CHAR16 *R = L"RAW";
+
+    if (!B->Media->MediaPresent || Bs < 512 || Bs > 65536) {
+        return L"-";
+    }
+    S = AllocatePool(Bs);
+    if (S == NULL) {
+        return L"-";
+    }
+    if (EFI_ERROR(Rd(B, 0, Bs, S))) {
+        R = L"-";
+    } else if (!CompareMem(S + 82, "FAT32   ", 8)) {
+        R = L"FAT32";
+    } else if (!CompareMem(S + 3, "NTFS    ", 8)) {
+        R = L"NTFS";
+    }
+    FreePool(S);
+    return R;
+}
+
+static BOOLEAN IsEsp(EFI_BLOCK_IO *B, UINT32 Num)
+{
+    UINT32 Bs = B->Media->BlockSize;
+    UINT8 *S;
+    UINT64 EntLba;
+    UINT32 EntSize;
+    UINT64 Lba;
+    UINTN Off;
+    BOOLEAN R = FALSE;
+
+    if (!B->Media->MediaPresent || Bs < 512 || Bs > 65536) {
+        return FALSE;
+    }
+    S = AllocatePool(Bs);
+    if (S == NULL) {
+        return FALSE;
+    }
+    if (!EFI_ERROR(Rd(B, 1, Bs, S)) && !CompareMem(S, "EFI PART", 8)) {
+        EntLba = Get64(S, 72);
+        EntSize = Get32(S, 84);
+        if (EntSize >= 32 && EntSize <= Bs) {
+            Lba = EntLba + ((UINT64)(Num - 1) * EntSize) / Bs;
+            Off = (UINTN)(((UINT64)(Num - 1) * EntSize) % Bs);
+            if (!EFI_ERROR(Rd(B, Lba, Bs, S))) {
+                R = !CompareMem(S + Off, &EfiPartTypeSystemPartitionGuid, 16);
+            }
+        }
+    } else if (!EFI_ERROR(Rd(B, 0, Bs, S)) && S[510] == 0x55 && S[511] == 0xAA && Num >= 1 && Num <= 4) {
+        R = S[446 + 16 * (Num - 1) + 4] == 0xEF;
+    }
+    FreePool(S);
+    return R;
+}
+
+static EFI_STATUS Fat32(EFI_BLOCK_IO *B)
+{
+    UINT32 Bs = B->Media->BlockSize;
+    UINT64 Total = B->Media->LastBlock + 1;
+    UINT64 Bytes = Total * Bs;
+    UINT64 Clusters;
+    UINT32 Spc;
+    UINT32 Reserved = 32;
+    UINT32 Tmp;
+    UINT32 FatSz;
+    UINT8 *S;
+    UINTN I;
+    EFI_STATUS St;
+
+    if (Bs < 512 || Bs > 4096 || (Bs & (Bs - 1)) != 0 || Total < 66600) {
+        return EFI_UNSUPPORTED;
+    }
+    if (Bytes <= ((UINT64)260 << 20)) {
+        Spc = 1;
+    } else if (Bytes <= ((UINT64)8 << 30)) {
+        Spc = 8;
+    } else if (Bytes <= ((UINT64)32 << 30)) {
+        Spc = 32;
+    } else {
+        Spc = 64;
+    }
+    Tmp = (Bs / 4) * Spc + 2;
+    FatSz = (UINT32)((Total - Reserved + Tmp - 1) / Tmp);
+    Clusters = (Total - Reserved - 2 * (UINT64)FatSz) / Spc;
+    if (Clusters < 65525) {
+        return EFI_UNSUPPORTED;
+    }
+    S = AllocateZeroPool(Bs);
+    if (S == NULL) {
+        return EFI_OUT_OF_RESOURCES;
+    }
+    for (I = Reserved + 2 * FatSz; I < Reserved + 2 * (UINT64)FatSz + Spc; I++) {
+        Wr(B, I, Bs, S);
+    }
+    S[0] = 0xEB; S[1] = 0x58; S[2] = 0x90;
+    CopyMem(S + 3, "IZHPEFMT", 8);
+    S[11] = (UINT8)Bs; S[12] = (UINT8)(Bs >> 8);
+    S[13] = (UINT8)Spc;
+    S[14] = (UINT8)Reserved; S[15] = (UINT8)(Reserved >> 8);
+    S[16] = 2;
+    S[21] = 0xF8;
+    S[24] = 63; S[26] = 255;
+    CopyMem(S + 28, &Total, 4);
+    CopyMem(S + 36, &FatSz, 4);
+    S[44] = 2;
+    S[48] = 1; S[50] = 6;
+    S[64] = 0x80; S[66] = 0x29;
+    CopyMem(S + 71, "NO NAME    ", 11);
+    CopyMem(S + 82, "FAT32   ", 8);
+    S[510] = 0x55; S[511] = 0xAA;
+    St = Wr(B, 0, Bs, S);
+    if (!EFI_ERROR(St)) {
+        St = Wr(B, 6, Bs, S);
+    }
+    ZeroMem(S, Bs);
+    CopyMem(S, "\x52\x52\x61\x41", 4);
+    CopyMem(S + 484, "\x72\x72\x41\x61", 4);
+    CopyMem(S + 508, "\x00\x00\x55\xAA", 4);
+    if (!EFI_ERROR(St)) St = Wr(B, 1, Bs, S);
+    if (!EFI_ERROR(St)) St = Wr(B, 7, Bs, S);
+    ZeroMem(S, Bs);
+    S[0] = 0xF8; S[1] = 0xFF; S[2] = 0xFF; S[3] = 0x0F;
+    S[4] = 0xFF; S[5] = 0xFF; S[6] = 0xFF; S[7] = 0x0F;
+    S[8] = 0xFF; S[9] = 0xFF; S[10] = 0xFF; S[11] = 0x0F;
+    if (!EFI_ERROR(St)) St = Wr(B, Reserved, Bs, S);
+    if (!EFI_ERROR(St)) St = Wr(B, (UINT64)Reserved + FatSz, Bs, S);
+    FreePool(S);
+    uefi_call_wrapper(B->FlushBlocks, 1, B);
+    return St;
+}
+
+static EFI_STATUS OpenRoot(EFI_HANDLE H, EFI_FILE_HANDLE *Root)
+{
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Fs = NULL;
+    EFI_STATUS St;
+
+    uefi_call_wrapper(BS->ConnectController, 4, H, NULL, NULL, TRUE);
+    St = uefi_call_wrapper(BS->HandleProtocol, 3, H, &FileSystemProtocol, (VOID **)&Fs);
+    if (EFI_ERROR(St) || Fs == NULL) {
+        return EFI_UNSUPPORTED;
+    }
+    return uefi_call_wrapper(Fs->OpenVolume, 2, Fs, Root);
+}
+
+static EFI_STATUS MkDir(EFI_FILE_HANDLE Root, CHAR16 *Path)
+{
+    EFI_FILE_HANDLE F;
+    EFI_STATUS St;
+
+    St = uefi_call_wrapper(Root->Open, 5, Root, &F, Path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, EFI_FILE_DIRECTORY);
+    if (!EFI_ERROR(St)) {
+        uefi_call_wrapper(F->Close, 1, F);
+    }
+    return St;
+}
+
+static EFI_STATUS CopyOne(EFI_FILE_HANDLE SrcRoot, CHAR16 *SrcPath, EFI_FILE_HANDLE DstRoot, CHAR16 *DstPath)
+{
+    EFI_FILE_HANDLE S;
+    EFI_FILE_HANDLE D;
+    EFI_FILE_INFO *Info;
+    UINT8 *Buf;
+    UINTN Size;
+    EFI_STATUS St;
+
+    St = uefi_call_wrapper(SrcRoot->Open, 5, SrcRoot, &S, SrcPath, EFI_FILE_MODE_READ, (UINT64)0);
+    if (EFI_ERROR(St)) {
+        return St;
+    }
+    Info = LibFileInfo(S);
+    if (Info == NULL) {
+        uefi_call_wrapper(S->Close, 1, S);
+        return EFI_DEVICE_ERROR;
+    }
+    Size = (UINTN)Info->FileSize;
+    FreePool(Info);
+    Buf = AllocatePool(Size ? Size : 1);
+    if (Buf == NULL) {
+        uefi_call_wrapper(S->Close, 1, S);
+        return EFI_OUT_OF_RESOURCES;
+    }
+    St = uefi_call_wrapper(S->Read, 3, S, &Size, Buf);
+    uefi_call_wrapper(S->Close, 1, S);
+    if (EFI_ERROR(St)) {
+        FreePool(Buf);
+        return St;
+    }
+    St = uefi_call_wrapper(DstRoot->Open, 5, DstRoot, &D, DstPath, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, (UINT64)0);
+    if (EFI_ERROR(St)) {
+        FreePool(Buf);
+        return St;
+    }
+    St = uefi_call_wrapper(D->Write, 3, D, &Size, Buf);
+    uefi_call_wrapper(D->Close, 1, D);
+    FreePool(Buf);
+    Print(L"  %s -> %s (%lu bytes)\n", SrcPath, DstPath, (UINT64)Size);
+    return St;
+}
+
+static VOID CreateBootEntry(EFI_HANDLE EspHandle)
+{
+    EFI_DEVICE_PATH *Dp = FileDevicePath(EspHandle, L"\\EFI\\IzhOS\\IzhOS.efi");
+    CHAR16 Desc[] = L"IzhOS";
+    UINTN DescBytes = StrSize(Desc);
+    UINTN DpBytes;
+    UINTN Total;
+    UINT8 *Opt;
+    UINTN Off = 0;
+    UINT32 Attr = LOAD_OPTION_ACTIVE;
+    UINT16 FpLen;
+    CHAR16 Name[12];
+    UINT16 Num = 0;
+    BOOLEAN Found = FALSE;
+    UINTN VarSize;
+    EFI_STATUS St;
+    UINT16 *Order;
+    UINT16 *NewOrder;
+
+    if (Dp == NULL) {
+        Print(L"Could not build boot entry path\n");
+        return;
+    }
+    DpBytes = DevicePathSize(Dp);
+    FpLen = (UINT16)DpBytes;
+    Total = sizeof(UINT32) + sizeof(UINT16) + DescBytes + DpBytes;
+    Opt = AllocatePool(Total);
+    if (Opt == NULL) {
+        FreePool(Dp);
+        return;
+    }
+    CopyMem(Opt + Off, &Attr, 4); Off += 4;
+    CopyMem(Opt + Off, &FpLen, 2); Off += 2;
+    CopyMem(Opt + Off, Desc, DescBytes); Off += DescBytes;
+    CopyMem(Opt + Off, Dp, DpBytes);
+
+    for (Num = 0; Num < 0xFFFF; Num++) {
+        SPrint(Name, sizeof(Name), L"Boot%04x", (UINTN)Num);
+        VarSize = 0;
+        St = uefi_call_wrapper(RT->GetVariable, 5, Name, &EfiGlobalVariable, NULL, &VarSize, NULL);
+        if (St == EFI_NOT_FOUND) {
+            Found = TRUE;
+            break;
+        }
+    }
+    if (!Found) {
+        Print(L"No free Boot#### slot\n");
+        FreePool(Opt);
+        FreePool(Dp);
+        return;
+    }
+    St = uefi_call_wrapper(RT->SetVariable, 5, Name, &EfiGlobalVariable,
+        EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS, Total, Opt);
+    if (EFI_ERROR(St)) {
+        Print(L"Failed to write %s: %r\n", Name, St);
+        FreePool(Opt);
+        FreePool(Dp);
+        return;
+    }
+
+    VarSize = 0;
+    uefi_call_wrapper(RT->GetVariable, 5, L"BootOrder", &EfiGlobalVariable, NULL, &VarSize, NULL);
+    Order = VarSize ? AllocatePool(VarSize) : NULL;
+    if (VarSize && Order != NULL) {
+        uefi_call_wrapper(RT->GetVariable, 5, L"BootOrder", &EfiGlobalVariable, NULL, &VarSize, Order);
+    }
+    NewOrder = AllocatePool(VarSize + 2);
+    if (NewOrder != NULL) {
+        NewOrder[0] = Num;
+        if (Order != NULL && VarSize > 0) {
+            CopyMem(NewOrder + 1, Order, VarSize);
+        }
+        uefi_call_wrapper(RT->SetVariable, 5, L"BootOrder", &EfiGlobalVariable,
+            EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS, VarSize + 2, NewOrder);
+        FreePool(NewOrder);
+    }
+    if (Order != NULL) {
+        FreePool(Order);
+    }
+    Print(L"Created boot entry %s (IzhOS), added to BootOrder\n", Name);
+    FreePool(Opt);
+    FreePool(Dp);
+}
+
+EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+{
+    EFI_LOADED_IMAGE *Li = NULL;
+    UINTN D;
+    UINTN P;
+    UINTN I;
+    UINTN Esp = (UINTN)-1;
+    CHAR16 Sz[48];
+    EFI_FILE_HANDLE SrcRoot;
+    EFI_FILE_HANDLE DstRoot;
+    EFI_FILE_HANDLE EspRoot;
+    EFI_STATUS St;
+    CONST CHAR16 *Names[] = { L"Kernel.efi", L"Command.efi", L"IzhDisk.efi", L"IzhPE.efi" };
+    CHAR16 SrcPath[64];
+    CHAR16 DstPath[64];
+
+    InitializeLib(ImageHandle, SystemTable);
+    ConnectAll();
+
+    if (!EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, ImageHandle, &LoadedImageProtocol, (VOID **)&Li)) && Li != NULL) {
+        gSelfDevice = Li->DeviceHandle;
+    }
+    if (gSelfDevice == NULL) {
+        Print(L"IzhPE: cannot determine boot device\n");
+        return EFI_LOAD_ERROR;
+    }
+
+    Print(L"IzhPE 1.0 - IzhOS installer\n\n");
+    Scan();
+    if (gDiskCount == 0) {
+        Print(L"No disks found\n");
+        return EFI_NOT_FOUND;
+    }
+    Print(L"Disk  Size          Parts\n");
+    for (I = 0; I < gDiskCount; I++) {
+        if (gDisks[I].Bio->Media->MediaPresent) {
+            SizeStr((gDisks[I].Bio->Media->LastBlock + 1) * gDisks[I].Bio->Media->BlockSize, Sz);
+        } else {
+            SPrint(Sz, sizeof(Sz), L"No media");
+        }
+        {
+            CHAR16 Num[24];
+            SPrint(Num, sizeof(Num), L"%d", (INTN)I);
+            Cell(Num, 6);
+            Cell(Sz, 14);
+            Print(L"%d\n", (INTN)gDisks[I].Parts);
+        }
+    }
+    if (!ReadNum(L"\nSelect disk: ", gDiskCount, &D)) {
+        Print(L"Cancelled\n");
+        return EFI_ABORTED;
+    }
+
+    Print(L"\nPart  Start LBA     Size          FS     Note\n");
+    for (I = 0; I < gPartCount; I++) {
+        if (gParts[I].Disk != D) {
+            continue;
+        }
+        SizeStr(gParts[I].Size * gDisks[D].Bio->Media->BlockSize, Sz);
+        {
+            CHAR16 Num[24];
+            SPrint(Num, sizeof(Num), L"%d", (INTN)gParts[I].Num);
+            Cell(Num, 6);
+            SPrint(Num, sizeof(Num), L"%lu", gParts[I].Start);
+            Cell(Num, 14);
+            Cell(Sz, 14);
+            Cell((CHAR16 *)FsName(gParts[I].Bio), 7);
+            Print(L"%s\n", IsEsp(gDisks[D].Bio, gParts[I].Num) ? L"(EFI System Partition)" : L"");
+        }
+    }
+    if (!ReadNum(L"\nSelect partition to install IzhOS to: ", 0x10000, &P)) {
+        Print(L"Cancelled\n");
+        return EFI_ABORTED;
+    }
+    for (I = 0; I < gPartCount; I++) {
+        if (gParts[I].Disk == D && (UINTN)gParts[I].Num == P) {
+            break;
+        }
+    }
+    if (I == gPartCount) {
+        Print(L"No such partition\n");
+        return EFI_NOT_FOUND;
+    }
+
+    Print(L"Install IzhOS files to disk %d partition %d.", (INTN)D, (INTN)P);
+    if (!Confirm()) {
+        Print(L"Aborted\n");
+        return EFI_ABORTED;
+    }
+
+    if (StrCmp(FsName(gParts[I].Bio), L"FAT32")) {
+        Print(L"Formatting partition as FAT32...\n");
+        St = Fat32(gParts[I].Bio);
+        if (EFI_ERROR(St)) {
+            Print(L"Format failed: %r\n", St);
+            return St;
+        }
+    }
+
+    St = OpenRoot(gSelfDevice, &SrcRoot);
+    if (EFI_ERROR(St)) {
+        Print(L"Cannot open install media: %r\n", St);
+        return St;
+    }
+    St = OpenRoot(gParts[I].H, &DstRoot);
+    if (EFI_ERROR(St)) {
+        Print(L"Cannot open target partition: %r\n", St);
+        return St;
+    }
+    MkDir(DstRoot, L"\\IzhOS");
+    MkDir(DstRoot, SYSTEM_DIR);
+    Print(L"Copying system files...\n");
+    for (I = 0; I < 4; I++) {
+        SPrint(SrcPath, sizeof(SrcPath), L"%s\\%s", SYSTEM_DIR, Names[I]);
+        SPrint(DstPath, sizeof(DstPath), L"%s\\%s", SYSTEM_DIR, Names[I]);
+        St = CopyOne(SrcRoot, SrcPath, DstRoot, DstPath);
+        if (EFI_ERROR(St) && I < 2) {
+            Print(L"  failed: %r (required file)\n", St);
+            return St;
+        }
+    }
+
+    Print(L"\nLooking for an EFI System Partition...\n");
+    Scan();
+    for (I = 0; I < gPartCount; I++) {
+        if (IsEsp(gDisks[gParts[I].Disk].Bio, gParts[I].Num)) {
+            Esp = I;
+            break;
+        }
+    }
+    if (Esp == (UINTN)-1) {
+        Print(L"No EFI System Partition found. Bootloader not installed; IzhOS files were still copied.\n");
+        return EFI_SUCCESS;
+    }
+    Print(L"Found ESP on disk %d partition %d\n", (INTN)gParts[Esp].Disk, (INTN)gParts[Esp].Num);
+    St = OpenRoot(gParts[Esp].H, &EspRoot);
+    if (EFI_ERROR(St)) {
+        Print(L"Cannot open ESP: %r\n", St);
+        return St;
+    }
+    MkDir(EspRoot, L"\\EFI");
+    MkDir(EspRoot, L"\\EFI\\IzhOS");
+    MkDir(EspRoot, L"\\EFI\\BOOT");
+    CopyOne(SrcRoot, L"\\EFI\\IzhOS\\IzhOS.efi", EspRoot, L"\\EFI\\IzhOS\\IzhOS.efi");
+    CopyOne(SrcRoot, L"\\EFI\\IzhOS\\IzhOS.efi", EspRoot, L"\\EFI\\BOOT\\BOOTX64.EFI");
+
+    CreateBootEntry(gParts[Esp].H);
+
+    Print(L"\nInstall complete.\n");
+    return EFI_SUCCESS;
+}
