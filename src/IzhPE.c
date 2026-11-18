@@ -320,6 +320,7 @@ static EFI_STATUS Fat32(EFI_BLOCK_IO *B)
     UINT8 *S;
     UINTN I;
     EFI_STATUS St;
+    EFI_PHYSICAL_ADDRESS Addr;
 
     if (Bs < 512 || Bs > 4096 || (Bs & (Bs - 1)) != 0 || Total < 66600) {
         return EFI_UNSUPPORTED;
@@ -339,10 +340,11 @@ static EFI_STATUS Fat32(EFI_BLOCK_IO *B)
     if (Clusters < 65525) {
         return EFI_UNSUPPORTED;
     }
-    S = AllocateZeroPool(Bs);
-    if (S == NULL) {
+    if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, EFI_SIZE_TO_PAGES(Bs), &Addr))) {
         return EFI_OUT_OF_RESOURCES;
     }
+    S = (UINT8 *)(UINTN)Addr;
+    ZeroMem(S, Bs);
     for (I = Reserved + 2 * FatSz; I < Reserved + 2 * (UINT64)FatSz + Spc; I++) {
         Wr(B, I, Bs, S);
     }
@@ -354,7 +356,7 @@ static EFI_STATUS Fat32(EFI_BLOCK_IO *B)
     S[16] = 2;
     S[21] = 0xF8;
     S[24] = 63; S[26] = 255;
-    CopyMem(S + 28, &Total, 4);
+    CopyMem(S + 32, &Total, 4);
     CopyMem(S + 36, &FatSz, 4);
     S[44] = 2;
     S[48] = 1; S[50] = 6;
@@ -378,7 +380,7 @@ static EFI_STATUS Fat32(EFI_BLOCK_IO *B)
     S[8] = 0xFF; S[9] = 0xFF; S[10] = 0xFF; S[11] = 0x0F;
     if (!EFI_ERROR(St)) St = Wr(B, Reserved, Bs, S);
     if (!EFI_ERROR(St)) St = Wr(B, (UINT64)Reserved + FatSz, Bs, S);
-    FreePool(S);
+    uefi_call_wrapper(BS->FreePages, 2, Addr, EFI_SIZE_TO_PAGES(Bs));
     uefi_call_wrapper(B->FlushBlocks, 1, B);
     return St;
 }
@@ -388,7 +390,7 @@ static EFI_STATUS OpenRoot(EFI_HANDLE H, EFI_FILE_HANDLE *Root)
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Fs = NULL;
     EFI_STATUS St;
 
-    uefi_call_wrapper(BS->ConnectController, 4, H, NULL, NULL, TRUE);
+    uefi_call_wrapper(BS->ConnectController, 4, H, NULL, NULL, FALSE);
     St = uefi_call_wrapper(BS->HandleProtocol, 3, H, &FileSystemProtocol, (VOID **)&Fs);
     if (EFI_ERROR(St) || Fs == NULL) {
         return EFI_UNSUPPORTED;
@@ -562,7 +564,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         return EFI_LOAD_ERROR;
     }
 
-    Print(L"IzhPE 1.0 - IzhOS installer\n\n");
+    Print(L"IzhPE 1.75 - IzhOS installer\n\n");
     Scan();
     if (gDiskCount == 0) {
         Print(L"No disks found\n");
